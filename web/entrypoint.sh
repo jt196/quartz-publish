@@ -2,26 +2,26 @@
 # Adapted from github.com/jagajaga/private-quartz-publish
 # server-example/quartz/entrypoint.sh, pinned to commit 3687b47a9b04ffb5ebd2740f328b8310251cc99c.
 #
-# Adaptation: the quartz invocation below calls bootstrap-cli.mjs directly
-# instead of upstream's `npx quartz` — same resolved code path, but skips
-# the extra ~90MB Node.js process npx/npm-exec keeps resident purely as a
-# supervisor for the child's lifetime.
+# Adaptation: one-shot builds on each content change instead of upstream's
+# persistent `quartz build --watch`. Quartz's watch mode keeps its whole
+# toolchain (esbuild, TypeScript, Preact SSR, MathJax/KaTeX, sharp) resident
+# in memory at all times -- ~550-600MB RSS on this box even fully idle --
+# purely so a rebuild after a change is sub-second instead of a ~30-60s cold
+# start. For a personal single-note-publish tool where changes are
+# infrequent, that trade is backwards: this cuts idle memory to just Caddy
+# (~40MB) at the cost of a ~30-60s delay before a publish/unpublish/edit
+# goes live. Also calls bootstrap-cli.mjs directly rather than through
+# `npx quartz`, for the same reason as before (no supervisor process).
 set -e
-
-# Long-lived Quartz watcher.
-#
-# Each `npx quartz build` is a cold Node start — TS compile of Quartz's own
-# source + plugin init costs ~30-60s before a single markdown file is parsed.
-# With `--watch`, Quartz keeps that process alive and rebuilds incrementally
-# (sub-second on small changes).
-#
-# Quartz v4 still wants to `rmdir` its output dir on each cycle, which fails
-# on a bind mount, so we build into a scratch dir and a tiny rsync loop
-# mirrors it to the real /site (the bind mount) whenever it changes.
 
 SCRATCH=/tmp/quartz-out
 mkdir -p /site "$SCRATCH"
 
+# A one-shot `quartz build` (no --watch) cleans its own output directory
+# before every run, so removed/rotated pages can never strand stale HTML the
+# way upstream's --watch-mode comment warns about -- no sweep step needed
+# here, unlike the persistent-watch version this replaces.
+#
 # Post-process: enforce browser-side lazy behavior on media tags, and inject
 # the in-page / folder-scoped find widget. Quartz's HTML pipeline strips these
 # attributes even when emitted by the stager, so we re-inject here after Quartz
@@ -32,45 +32,18 @@ mkdir -p /site "$SCRATCH"
 #   preload="none"  — video/audio: don't fetch the file until the user
 #                     presses play. (Default would fetch metadata + a
 #                     chunk; "none" suppresses that.)
-#
-# Also re-stages /pf-find.js into SCRATCH each pass (so a stale Quartz rebuild
-# can't strand the asset) and injects a single <script src="/pf-find.js" defer>
-# before </body> — idempotent, so re-runs over the same file are safe.
 postprocess_lazy() {
   cp /pf-find.js "$SCRATCH/pf-find.js" 2>/dev/null || true
   node -e '
     const fs = require("fs");
     const path = require("path");
     const SCRATCH = "'"$SCRATCH"'";
-    const CONTENT = "/quartz/content";
     const TAG = "<script src=\"/pf-find.js\" defer></script>";
-    // Framework pages Quartz emits without a markdown counterpart. Everything
-    // else MUST be backed by a live /quartz/content/<path>.md or get swept —
-    // Quartz --watch does not delete output files when the source disappears
-    // (slug rotation, unpublish, file delete), which would otherwise leak old
-    // URLs forever. This sweep is the privacy guarantee.
-    const KEEP_ORPHAN_HTML = new Set(["404.html"]);
     function walk(dir) {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
         const p = path.join(dir, e.name);
-        if (e.isDirectory()) {
-          walk(p);
-          // Prune empty dirs left behind by sweeps.
-          try { fs.rmdirSync(p); } catch { /* not empty */ }
-          continue;
-        }
+        if (e.isDirectory()) { walk(p); continue; }
         if (!e.name.endsWith(".html")) continue;
-
-        // Sweep stale HTML first — no point post-processing a doomed file.
-        const rel = path.relative(SCRATCH, p);
-        if (!KEEP_ORPHAN_HTML.has(rel)) {
-          const mdPath = path.join(CONTENT, rel.replace(/\.html$/, ".md"));
-          if (!fs.existsSync(mdPath)) {
-            try { fs.unlinkSync(p); } catch {}
-            continue;
-          }
-        }
-
         let s = fs.readFileSync(p, "utf8");
         const orig = s;
         s = s.replace(/<(img|video|audio)(?![^>]*\bloading=)/g, "<$1 loading=\"lazy\"");
@@ -86,22 +59,6 @@ postprocess_lazy() {
   ' 2>/dev/null || true
 }
 
-# ── Background: rsync SCRATCH → /site whenever Quartz writes ──
-# Also watch /quartz/content: a pure-delete in content (stager removing a
-# rotated/unpublished slug) produces no SCRATCH event, but we still need the
-# sweep + rsync to run promptly. Without this, an unpublish would linger up
-# to the inotifywait timeout (120s) before /site catches up.
-(
-  while true; do
-    inotifywait -r -q -e close_write,create,delete,moved_to \
-      "$SCRATCH" /quartz/content --timeout 120 2>/dev/null || true
-    # tiny debounce so a batch of writes becomes one rsync
-    sleep 0.5
-    postprocess_lazy
-    rsync -a --delete "$SCRATCH"/ /site/ 2>/dev/null || true
-  done
-) &
-
 clear_site_if_content_empty() {
   if [ -z "$(ls -A /quartz/content 2>/dev/null)" ]; then
     find /site -mindepth 1 -delete 2>/dev/null || true
@@ -109,25 +66,52 @@ clear_site_if_content_empty() {
   fi
 }
 
-# ── Main supervisor: keep quartz --watch alive ──
+# ── Background: mark $DIRTY on any content change ──
+# Runs continuously, including while a build is in progress, so a change
+# made mid-build is never lost -- the main loop below just compares $DIRTY's
+# mtime against the content-state it last built from, once its current
+# build finishes.
+DIRTY=/tmp/quartz-dirty
+touch "$DIRTY"
+(
+  while true; do
+    inotifywait -r -q -e close_write,create,delete,moved_to \
+      /quartz/content --timeout 120 2>/dev/null || true
+    touch "$DIRTY"
+  done
+) &
+
+# ── Main supervisor: one-shot build per (debounced) change ──
+last_built=""
 while true; do
   if [ -z "$(ls -A /quartz/content 2>/dev/null)" ]; then
     clear_site_if_content_empty
+    last_built=""
     echo "[quartz] Content empty — waiting for first file to appear..."
     inotifywait -q -e create,moved_to /quartz/content --timeout 300 2>/dev/null || true
     continue
   fi
 
-  echo "[quartz] Starting in --watch mode (incremental rebuilds)"
-  # --watch keeps the process alive; output goes to SCRATCH; rsync loop above
-  # mirrors it to the bind-mounted /site. No --serve = no extra HTTP server.
-  #
-  # Calling the bin directly instead of `npx quartz` (upstream's original
-  # invocation): npx resolves @jackyzha0/quartz's own declared bin correctly
-  # (no network fetch, no unrelated registry package), but keeps a second,
-  # full Node.js process resident for the child's entire lifetime purely as
-  # a supervisor — ~90MB RSS for nothing, on a long-running --watch process.
-  node --no-deprecation ./quartz/bootstrap-cli.mjs build --watch --output "$SCRATCH" 2>&1 || true
-  echo "[quartz] watch mode exited (likely a build error); restarting in 5s"
-  sleep 5
+  dirty_at=$(stat -c %Y "$DIRTY" 2>/dev/null || echo 0)
+  if [ "$dirty_at" = "$last_built" ]; then
+    # Nothing changed since our last build — block cheaply until something does.
+    sleep 2
+    continue
+  fi
+
+  # Debounce: wait for a quiet second so a burst of writes (e.g. publishing a
+  # multi-file folder bundle) settles into one rebuild instead of several.
+  sleep 1
+  settled_at=$(stat -c %Y "$DIRTY" 2>/dev/null || echo 0)
+  if [ "$settled_at" != "$dirty_at" ]; then
+    continue # more writes arrived during the debounce window; wait for another
+  fi
+
+  echo "[quartz] Building (one-shot; ~30-60s cold start is expected)"
+  node --no-deprecation ./quartz/bootstrap-cli.mjs build --output "$SCRATCH" 2>&1 || \
+    echo "[quartz] build failed; will retry on next change"
+  postprocess_lazy
+  rsync -a --delete "$SCRATCH"/ /site/ 2>/dev/null || true
+  last_built="$settled_at"
+  echo "[quartz] build complete"
 done

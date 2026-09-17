@@ -8,7 +8,7 @@ upstream three:
 | Image | What it does | Vault access | Exposed ports |
 |---|---|---|---|
 | `ghcr.io/jt196/quartz-publish-stager` | Deno process. Mirrors only notes with `publish: true` (plus embeds, link-rewritten) into a flat, Docker-internal content volume. | Reads the vault **read-only**. | **None.** No listener, no inbound network. |
-| `ghcr.io/jt196/quartz-publish-web` | Quartz v4 build-watch loop + Caddy (static serving only — `try_files` fallback, security headers, custom 404). | **None.** Only ever reads the content volume the stager writes. | `8080` (put a reverse proxy in front for TLS). |
+| `ghcr.io/jt196/quartz-publish-web` | One-shot Quartz v4 build per content change + Caddy (static serving only — `try_files` fallback, security headers, custom 404). | **None.** Only ever reads the content volume the stager writes. | `8080` (put a reverse proxy in front for TLS). |
 
 ## Why two images, not one
 
@@ -48,14 +48,38 @@ Adapted:
 - `web/Caddyfile` — same `try_files`/headers/error-handling as upstream,
   but serves plain HTTP on `:8080` instead of a domain block with ACME —
   TLS is the reverse proxy's job now, not this container's.
-- `web/entrypoint.sh` — same watch/rsync/postprocess loop as upstream,
-  except it invokes `bootstrap-cli.mjs` directly instead of `npx quartz`,
-  which saves ~90MB RSS by not keeping a second Node.js process resident
-  purely as an `npm exec` supervisor (see file header for detail).
+- `web/entrypoint.sh` — rebuilds one-shot per debounced content change
+  instead of upstream's persistent `quartz build --watch`, and invokes
+  `bootstrap-cli.mjs` directly instead of `npx quartz`. See "Why one-shot
+  builds" below.
 
 To re-sync after an upstream change: diff the pinned commit against
 upstream's `server-example/`, re-apply the two adaptations above to
 whatever changed, bump the pinned commit in the header comments.
+
+## Why one-shot builds, not `--watch`
+
+Upstream's `web` runs `quartz build --watch` continuously, keeping its
+whole toolchain (esbuild, TypeScript, Preact SSR, MathJax/KaTeX, sharp)
+resident in memory at all times — measured at ~550-600MB RSS on this NAS,
+fully idle, so that a rebuild after a change is sub-second instead of
+paying Quartz's ~30-60s cold start (TS compile of its own source + plugin
+init) on every single change.
+
+For a personal single-note-publish tool where publishes are infrequent,
+that trade is backwards. `web/entrypoint.sh` instead watches the content
+directory, debounces a burst of writes into one rebuild, runs a one-shot
+`quartz build`, and lets Node exit completely — idle memory drops to just
+Caddy (~15-40MB) at the cost of a ~30-60s delay before a publish, edit,
+unpublish, or rotate goes live. A change that arrives while a build is
+already in progress is never lost: a background watcher marks a dirty
+timestamp continuously (including mid-build), and the main loop compares
+it against what it last built from, so it always ends up building the
+latest state at least once more if anything changed during a build.
+
+If publish frequency ever goes up enough that the delay stops being worth
+it, reverting to `--watch` is a one-line change in `entrypoint.sh` (see
+git history around this comment for the previous version).
 
 ## Building
 
