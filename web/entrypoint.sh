@@ -1,4 +1,11 @@
 #!/bin/bash
+# Adapted from github.com/jagajaga/private-quartz-publish
+# server-example/quartz/entrypoint.sh, pinned to commit 3687b47a9b04ffb5ebd2740f328b8310251cc99c.
+#
+# Adaptation: the quartz invocation below calls bootstrap-cli.mjs directly
+# instead of upstream's `npx quartz` — same resolved code path, but skips
+# the extra ~90MB Node.js process npx/npm-exec keeps resident purely as a
+# supervisor for the child's lifetime.
 set -e
 
 # Long-lived Quartz watcher.
@@ -114,7 +121,13 @@ while true; do
   echo "[quartz] Starting in --watch mode (incremental rebuilds)"
   # --watch keeps the process alive; output goes to SCRATCH; rsync loop above
   # mirrors it to the bind-mounted /site. No --serve = no extra HTTP server.
-  npx quartz build --watch --output "$SCRATCH" 2>&1 || true
+  #
+  # Calling the bin directly instead of `npx quartz` (upstream's original
+  # invocation): npx resolves @jackyzha0/quartz's own declared bin correctly
+  # (no network fetch, no unrelated registry package), but keeps a second,
+  # full Node.js process resident for the child's entire lifetime purely as
+  # a supervisor — ~90MB RSS for nothing, on a long-running --watch process.
+  node --no-deprecation ./quartz/bootstrap-cli.mjs build --watch --output "$SCRATCH" 2>&1 || true
   echo "[quartz] watch mode exited (likely a build error); restarting in 5s"
   sleep 5
 done

@@ -37,8 +37,8 @@ about the privacy model changed, only which container the two halves run in.
 
 Straight copies of upstream `server-example/` files, pinned to commit
 `3687b47a9b04ffb5ebd2740f328b8310251cc99c` (noted in each file's header):
-`stager/main.ts`, `web/entrypoint.sh`, `web/pf-find.js`,
-`web/FolderSidebar.tsx`, `web/quartz.layout.ts`.
+`stager/main.ts`, `web/pf-find.js`, `web/FolderSidebar.tsx`,
+`web/quartz.layout.ts`.
 
 Adapted:
 - `web/quartz.config.ts.template` — same as upstream except `baseUrl` and
@@ -46,8 +46,12 @@ Adapted:
   `PAGE_TITLE` env vars at container start (`web/s6-rc.d/quartz/run`) so the
   domain doesn't have to be baked in at build time.
 - `web/Caddyfile` — same `try_files`/headers/error-handling as upstream,
-  but serves plain HTTP on `:8080` instead of a domain block with ACID —
+  but serves plain HTTP on `:8080` instead of a domain block with ACME —
   TLS is the reverse proxy's job now, not this container's.
+- `web/entrypoint.sh` — same watch/rsync/postprocess loop as upstream,
+  except it invokes `bootstrap-cli.mjs` directly instead of `npx quartz`,
+  which saves ~90MB RSS by not keeping a second Node.js process resident
+  purely as an `npm exec` supervisor (see file header for detail).
 
 To re-sync after an upstream change: diff the pinned commit against
 upstream's `server-example/`, re-apply the two adaptations above to
