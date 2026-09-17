@@ -1,0 +1,28 @@
+# Adapted from github.com/jagajaga/private-quartz-publish
+# server-example/caddy/Caddyfile, pinned to commit 3687b47a9b04ffb5ebd2740f328b8310251cc99c.
+#
+# Adaptation: serves plain HTTP on :8080 instead of a domain block, since
+# Nginx Proxy Manager (not this container) terminates TLS and does ACME.
+# try_files/headers/handle_errors logic is unchanged from upstream.
+
+:8080 {
+    root * /site
+    encode gzip zstd
+
+    # Quartz emits Foo.html but its internal links use /Foo, so the static
+    # file server must fall back through .html and /index.html to resolve
+    # extensionless URLs.
+    try_files {path} {path}.html {path}/index.html
+    file_server
+
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    handle_errors {
+        rewrite * /404.html
+        file_server
+    }
+}

@@ -1,0 +1,661 @@
+// Vendored unchanged from github.com/jagajaga/private-quartz-publish
+// server-example/stager/main.ts, pinned to commit 3687b47a9b04ffb5ebd2740f328b8310251cc99c.
+// Re-sync manually if upstream changes; do not hand-edit.
+
+// Quartz publish stager (folder-aware).
+//
+// Mirrors only those vault notes that explicitly contain `publish: true`
+// in frontmatter into a flat content directory that Quartz reads from.
+// The vault itself is never exposed to Quartz.
+//
+// Output structure (all flat at the root of CONTENT, no vault folders):
+//   /<slug>.md              standalone copy of a published note
+//   /<folder>/<slug>.md     in-folder copy of a published note that lives
+//                           in a published folder (sidebar UX)
+//   /<folder>/index.md      folder landing page (auto-generated listing)
+//   /<hash>.<ext>           embed (image / pdf) by content hash
+//
+// Folder publishing state is read from the Obsidian plugin's data.json:
+//   .obsidian/plugins/quartz-publish-toggle/data.json
+// Schema: { "folders": { "<vault-folder-path>": "<folder-slug>" } }
+//
+// Slug source for notes: frontmatter `slug:` (assigned by the plugin).
+// Fallback for legacy publishes (no slug): basename with spaces → dashes.
+//
+// Markdown rewriting per copy:
+//   ![[name.png]]   → ![[<hash>.png]]               embed by hash
+//   ![alt](path)    → ![alt](/<hash>.png)           embed by hash
+//   [[other-note]]  → [other](/<scope-prefix><slug>) if target is published
+//                     (scope-prefix is the current copy's folder, if any,
+//                      so navigation stays in-folder when in-folder)
+//                   → plain text if target is NOT published (no leak)
+//   slug:           → stripped from staged frontmatter
+
+import { parse as parseYaml } from "https://deno.land/std@0.224.0/yaml/parse.ts";
+import { walk } from "https://deno.land/std@0.224.0/fs/walk.ts";
+import { ensureDir } from "https://deno.land/std@0.224.0/fs/ensure_dir.ts";
+import {
+  basename,
+  dirname,
+  extname,
+  join,
+  relative,
+} from "https://deno.land/std@0.224.0/path/mod.ts";
+import { encodeHex } from "https://deno.land/std@0.224.0/encoding/hex.ts";
+
+const VAULT = Deno.env.get("VAULT_DIR") ?? "/vault";
+const CONTENT = Deno.env.get("CONTENT_DIR") ?? "/content";
+const PLUGIN_DATA_PATH = join(
+  VAULT,
+  ".obsidian/plugins/quartz-publish-toggle/data.json",
+);
+const DEBOUNCE_MS = 1500;
+const EMBED_HASH_LEN = 12;
+
+// Skip everything under .obsidian/ EXCEPT the plugin data file we need.
+const SKIP_DIRS = [/[\/\\]\.obsidian([\/\\]|$)/, /[\/\\]\.trash([\/\\]|$)/];
+
+const EMBED_RE_WIKI = /!\[\[([^\]|#]+)(?:[|#]([^\]]*))?\]\]/g;
+const EMBED_RE_MD = /!\[([^\]]*)\]\(([^)]+)\)/g;
+const LINK_RE_WIKI = /(?<!!)\[\[([^\]|#]+)(?:[|#]([^\]]*))?\]\]/g;
+// Plain markdown link `[text](url)` (not preceded by `!`). We convert any
+// such link whose target is a media file into inline raw HTML so the
+// published page shows the media directly instead of a clickable text link.
+// Raw HTML is used (rather than `![]()` embed syntax) because Quartz treats
+// external URLs in embed syntax as external links with an icon, not as
+// images/videos. Raw HTML survives Quartz's markdown pipeline as-is.
+const LINK_RE_MD = /(?<!!)\[([^\]]*)\]\(([^)\s]+)\)/g;
+const IMG_EXT_RE = /\.(jpg|jpeg|png|gif|webp|svg|avif)(?:[?#].*)?$/i;
+const VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i;
+const AUDIO_EXT_RE = /\.(mp3|wav|ogg|m4a|opus|aac|flac)(?:[?#].*)?$/i;
+function htmlEscape(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function mediaHtml(url: string, alt: string): string | null {
+  const safeUrl = htmlEscape(url);
+  const safeAlt = htmlEscape(alt);
+  if (IMG_EXT_RE.test(url)) {
+    return `<img class="inline-media" src="${safeUrl}" alt="${safeAlt}" />`;
+  }
+  if (VIDEO_EXT_RE.test(url)) {
+    return `<video class="inline-media" src="${safeUrl}" controls></video>`;
+  }
+  if (AUDIO_EXT_RE.test(url)) {
+    return `<audio class="inline-media" src="${safeUrl}" controls></audio>`;
+  }
+  return null;
+}
+
+interface NoteInfo {
+  /** Absolute vault path. */
+  vaultPath: string;
+  /** Vault path relative to VAULT (forward slashes). */
+  relPath: string;
+  /** Slug from frontmatter (or fallback). */
+  slug: string;
+  /** Title from frontmatter (or basename). */
+  title: string;
+  /** Raw file content. */
+  raw: string;
+  /** Offset where body starts (after frontmatter). */
+  bodyStart: number;
+  /** Vault folder this note lives in (relPath of parent, "" if at root). */
+  parentFolder: string;
+  /** `folder_slug` from frontmatter (if part of a published bundle). */
+  folderSlug: string | null;
+  /** `folder_name` from frontmatter (optional display name override). */
+  folderName: string | null;
+  /** `folder_path` from frontmatter (relative path within its bundle). */
+  folderPath: string | null;
+}
+
+function extractFrontmatter(
+  content: string,
+): { fm: Record<string, unknown> | null; bodyStart: number } {
+  if (!content.startsWith("---")) return { fm: null, bodyStart: 0 };
+  const end = content.indexOf("\n---", 3);
+  if (end < 0) return { fm: null, bodyStart: 0 };
+  const yaml = content.slice(3, end).trim();
+  try {
+    const parsed = parseYaml(yaml);
+    return {
+      fm: (parsed && typeof parsed === "object")
+        ? parsed as Record<string, unknown>
+        : null,
+      bodyStart: end + 4,
+    };
+  } catch {
+    return { fm: null, bodyStart: 0 };
+  }
+}
+
+async function hashFile(path: string, len = EMBED_HASH_LEN): Promise<string> {
+  const data = await Deno.readFile(path);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return encodeHex(new Uint8Array(digest)).slice(0, len);
+}
+
+function fallbackSlug(vaultPath: string): string {
+  return basename(vaultPath).replace(/\.md$/i, "").replace(/\s+/g, "-");
+}
+
+function stripPrivateFrontmatter(fmText: string): string {
+  // Strip values that should never leak to the public site.
+  return fmText
+    .replace(/^slug:[^\n]*\n?/m, "")
+    .replace(/^folder_slug:[^\n]*\n?/m, "")
+    .replace(/^folder_name:[^\n]*\n?/m, "")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+/**
+ * Inject a `key: "value"` line into the frontmatter unless that key is
+ * already declared. Used to ensure Quartz sees a title, folder_path, etc.,
+ * without clobbering values the user explicitly set.
+ */
+function ensureFrontmatterKey(
+  fmText: string,
+  key: string,
+  value: string,
+): string {
+  const re = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*\\S`, "m");
+  if (re.test(fmText)) return fmText;
+  const safe = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  if (fmText.startsWith("---\n")) {
+    return `---\n${key}: "${safe}"\n` + fmText.slice(4);
+  }
+  if (fmText.startsWith("---\r\n")) {
+    return `---\r\n${key}: "${safe}"\r\n` + fmText.slice(5);
+  }
+  return `---\n${key}: "${safe}"\n---\n` + fmText;
+}
+
+function resolveByName(
+  name: string,
+  byName: Map<string, string>,
+): string | null {
+  const trimmed = name.trim();
+  if (byName.has(trimmed)) return byName.get(trimmed)!;
+  const tail = trimmed.split("/").pop()!;
+  if (byName.has(tail)) return byName.get(tail)!;
+  return null;
+}
+
+async function readFolderState(): Promise<Record<string, string>> {
+  try {
+    const raw = await Deno.readTextFile(PLUGIN_DATA_PATH);
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.folders &&
+      typeof parsed.folders === "object") {
+      return parsed.folders as Record<string, string>;
+    }
+  } catch { /* file missing — ok */ }
+  return {};
+}
+
+function rewriteBody(
+  body: string,
+  notes: Map<string, NoteInfo>,
+  byName: Map<string, string>,
+  embedSlugByPath: Map<string, string>,
+  scopePrefix: string, // "" for standalone copies, "<folder-slug>/" for folder copies
+): string {
+  let out = body;
+
+  // Convert media references to inline raw HTML so they render as
+  // <img>/<video>/<audio> on the published page. Three accepted shapes:
+  //
+  //   [text](url.jpg)        plain link, no leading !
+  //   ![alt](url.jpg)        markdown embed, leading !
+  //
+  // Both render inline. For `![alt](LOCAL.jpg)`, the existing EMBED_RE_MD
+  // pipeline below still handles local files (with content-hash naming).
+  // Here we only catch EXTERNAL URLs in embed syntax — Quartz/OFM
+  // otherwise renders external `![](url)` as a clickable link.
+  out = out.replaceAll(LINK_RE_MD, (full, text, url) => {
+    const html = mediaHtml(url, text);
+    return html ?? full;
+  });
+  out = out.replaceAll(EMBED_RE_MD, (full, alt, ref) => {
+    if (/^https?:\/\//.test(ref)) {
+      const html = mediaHtml(ref, alt);
+      if (html) return html;
+      return full;
+    }
+    // local path — fall through to the existing local-file rewriter below
+    return full;
+  });
+
+  out = out.replaceAll(EMBED_RE_WIKI, (full, name, alias) => {
+    const target = resolveByName(name, byName);
+    if (!target) return alias || name;
+    if (target.endsWith(".md")) {
+      const note = notes.get(target);
+      return note ? `![[${note.slug}]]` : (alias || name);
+    }
+    const embedSlug = embedSlugByPath.get(target);
+    const ext = extname(target);
+    return embedSlug ? `![[${embedSlug}${ext}]]` : full;
+  });
+
+  out = out.replaceAll(EMBED_RE_MD, (full, alt, ref) => {
+    if (/^https?:\/\//.test(ref)) return full;
+    const cleaned = ref.split("#")[0].split("?")[0].trim();
+    const target = resolveByName(cleaned, byName);
+    if (!target) return full;
+    const embedSlug = embedSlugByPath.get(target);
+    const ext = extname(target);
+    return embedSlug ? `![${alt}](/${embedSlug}${ext})` : full;
+  });
+
+  out = out.replaceAll(LINK_RE_WIKI, (_full, name, alias) => {
+    const target = resolveByName(name, byName);
+    if (!target) return alias || name;
+    const note = notes.get(target);
+    if (!note) return alias || name;
+    const display = alias || name;
+    return `[${display}](/${scopePrefix}${note.slug})`;
+  });
+
+  return out;
+}
+
+async function stageNoteCopy(
+  note: NoteInfo,
+  destRel: string,
+  scopePrefix: string,
+  notes: Map<string, NoteInfo>,
+  byName: Map<string, string>,
+  embedSlugByPath: Map<string, string>,
+  wanted: Set<string>,
+  /**
+   * When set, the staged copy gets a `folder_path: "<value>"` line so the
+   * FolderSidebar component can build a hierarchical tree. Pass `null` for
+   * standalone copies (no sidebar is rendered anyway).
+   */
+  bundleFolderPath: string | null = null,
+) {
+  const fmText = note.raw.slice(0, note.bodyStart);
+  const body = note.raw.slice(note.bodyStart);
+  const rewritten = rewriteBody(body, notes, byName, embedSlugByPath, scopePrefix);
+  let staged = stripPrivateFrontmatter(fmText);
+  staged = ensureFrontmatterKey(staged, "title", note.title);
+  if (bundleFolderPath) {
+    staged = ensureFrontmatterKey(staged, "folder_path", bundleFolderPath);
+  }
+  staged = staged + rewritten;
+  const dst = join(CONTENT, destRel);
+  await ensureDir(dirname(dst));
+  await Deno.writeTextFile(dst, staged);
+  wanted.add(dst);
+}
+
+function generateFolderIndex(
+  folderName: string,
+  folderSlug: string,
+  files: NoteInfo[],
+): string {
+  // List entries link into the folder-scoped versions so the sidebar persists
+  // as the visitor clicks through.
+  const list = files
+    .slice()
+    .sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }))
+    .map((n) => `- [${n.title}](/${folderSlug}/${n.slug})`)
+    .join("\n");
+  // Quoted title is YAML-safe even when the folder name contains `:`, `#`, etc.
+  // `publish: true` is required so the ExplicitPublish filter doesn't drop it.
+  const safeName = folderName.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `---\npublish: true\ntitle: "${safeName}"\n---\n\n# ${folderName}\n\n${list}\n`;
+}
+
+/**
+ * Strip markdown to plain text for the folder search index snippet. We only
+ * need approximate readability — the browser does substring matching, not
+ * tokenized search — so this is intentionally conservative (no AST parse).
+ */
+function plainText(md: string, limit = 400): string {
+  let s = md;
+  // Drop fenced code blocks entirely (noise + can be huge in tech notes).
+  s = s.replace(/```[\s\S]*?```/g, " ");
+  // Strip HTML tags (the stager emits raw <img>/<video>/<audio> for media).
+  s = s.replace(/<[^>]+>/g, " ");
+  // Image embeds: `![alt](url)` → alt.
+  s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
+  // Wiki embeds: `![[file]]` → "" (the target isn't meaningful to a reader).
+  s = s.replace(/!\[\[[^\]]*\]\]/g, " ");
+  // Links: `[text](url)` → text.  `[[wiki|alias]]` → alias or wiki.
+  s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2");
+  s = s.replace(/\[\[([^\]]+)\]\]/g, "$1");
+  // Inline formatting markers.
+  s = s.replace(/[*_~`>#]+/g, " ");
+  // Collapse whitespace.
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length <= limit) return s;
+  // Cut at a word boundary near the limit if possible.
+  const cut = s.slice(0, limit);
+  const lastSpace = cut.lastIndexOf(" ");
+  return (lastSpace > limit - 80 ? cut.slice(0, lastSpace) : cut).trimEnd() + "…";
+}
+
+/**
+ * Per-bundle search index consumed by pf-find.js. Lives at
+ *   /<bundle.slug>/_search.json
+ * Each entry is `{ slug, title, snippet }` — slug is the file's slug within
+ * the bundle (so the link is `/<bundle.slug>/<slug>`). The snippet is plain-
+ * text from the body so the browser-side substring match returns useful hits
+ * even when the title doesn't contain the query.
+ */
+function generateFolderSearchIndex(
+  bundleNotes: NoteInfo[],
+): string {
+  const entries = bundleNotes
+    .slice()
+    .sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }))
+    .map((n) => ({
+      slug: n.slug,
+      title: n.title,
+      snippet: plainText(n.raw.slice(n.bodyStart)),
+    }));
+  return JSON.stringify(entries);
+}
+
+async function reconcile() {
+  await ensureDir(CONTENT);
+
+  // ---- Pass 1: index every vault file by name ----
+  const byName = new Map<string, string>();
+  const mdFiles: string[] = [];
+  for await (
+    const entry of walk(VAULT, { includeDirs: false, skip: SKIP_DIRS })
+  ) {
+    byName.set(entry.name, entry.path);
+    const stem = entry.name.replace(/\.[^/.]+$/, "");
+    if (!byName.has(stem)) byName.set(stem, entry.path);
+    if (entry.name.endsWith(".md")) mdFiles.push(entry.path);
+  }
+
+  // ---- Pass 2: load folder state from plugin data.json ----
+  const folderSlugs = await readFolderState();
+  // Sanitize: keep entries that reference real folder paths.
+  for (const folderRel of Object.keys(folderSlugs)) {
+    const abs = join(VAULT, folderRel);
+    try {
+      const st = await Deno.stat(abs);
+      if (!st.isDirectory) delete folderSlugs[folderRel];
+    } catch {
+      delete folderSlugs[folderRel];
+    }
+  }
+
+  // ---- Pass 3: identify published notes ----
+  const notes = new Map<string, NoteInfo>();
+  for (const path of mdFiles) {
+    let raw: string;
+    try { raw = await Deno.readTextFile(path); } catch { continue; }
+    const { fm, bodyStart } = extractFrontmatter(raw);
+    if (!fm || fm.publish !== true) continue;
+    const slug = (typeof fm.slug === "string" && fm.slug.length > 0)
+      ? fm.slug
+      : fallbackSlug(path);
+    const title = (typeof fm.title === "string" && fm.title.length > 0)
+      ? fm.title
+      : basename(path).replace(/\.md$/i, "");
+    const relPath = relative(VAULT, path).split("\\").join("/");
+    const parentFolder = dirname(relPath);
+    const folderSlug =
+      typeof fm.folder_slug === "string" && fm.folder_slug.length > 0
+        ? fm.folder_slug
+        : null;
+    const folderName =
+      typeof fm.folder_name === "string" && fm.folder_name.length > 0
+        ? fm.folder_name
+        : null;
+    const folderPath =
+      typeof fm.folder_path === "string" && fm.folder_path.length > 0
+        ? fm.folder_path
+        : null;
+    notes.set(path, {
+      vaultPath: path,
+      relPath,
+      slug,
+      title,
+      raw,
+      bodyStart,
+      parentFolder: parentFolder === "." ? "" : parentFolder,
+      folderSlug,
+      folderName,
+      folderPath,
+    });
+  }
+
+  // ---- Pass 4: discover embeds referenced by published notes ----
+  const embedSlugByPath = new Map<string, string>();
+  for (const [, note] of notes) {
+    const body = note.raw.slice(note.bodyStart);
+    const collect = async (name: string) => {
+      const target = resolveByName(name, byName);
+      if (!target || target.endsWith(".md")) return;
+      if (embedSlugByPath.has(target)) return;
+      embedSlugByPath.set(target, await hashFile(target));
+    };
+    for (const m of body.matchAll(EMBED_RE_WIKI)) await collect(m[1]);
+    for (const m of body.matchAll(EMBED_RE_MD)) {
+      const ref = m[2].trim();
+      if (/^https?:\/\//.test(ref)) continue;
+      const cleaned = ref.split("#")[0].split("?")[0];
+      await collect(cleaned);
+    }
+  }
+
+  // ---- Pass 5: build bundle map ----
+  // Source of truth #1 (preferred): each published note's own `folder_slug`
+  // frontmatter — set by the Obsidian plugin when the folder was published.
+  // Source of truth #2 (legacy fallback): the plugin's data.json that maps
+  // vault-folder-path → folder-slug. Kept so existing deployments still work.
+  interface Bundle {
+    slug: string;
+    name: string;
+    notes: NoteInfo[];
+  }
+  const bundles = new Map<string, Bundle>(); // folder-slug → bundle
+
+  // Index notes by their parentFolder (used by the data.json fallback).
+  const notesByFolder = new Map<string, NoteInfo[]>();
+  for (const [, note] of notes) {
+    const arr = notesByFolder.get(note.parentFolder) ?? [];
+    arr.push(note);
+    notesByFolder.set(note.parentFolder, arr);
+  }
+
+  // 5a. Frontmatter-derived bundles (source of truth #1).
+  for (const [, note] of notes) {
+    if (!note.folderSlug) continue;
+    let bundle = bundles.get(note.folderSlug);
+    if (!bundle) {
+      const fallbackName = note.folderName ??
+        (basename(note.parentFolder) || note.parentFolder || note.folderSlug);
+      bundle = { slug: note.folderSlug, name: fallbackName, notes: [] };
+      bundles.set(note.folderSlug, bundle);
+    }
+    if (!bundle.notes.some((n) => n.vaultPath === note.vaultPath)) {
+      bundle.notes.push(note);
+    }
+  }
+
+  // 5b. data.json-derived bundles (legacy fallback, dedup against 5a).
+  for (const [folderPath, folderSlug] of Object.entries(folderSlugs)) {
+    const folderNotes = notesByFolder.get(folderPath) ?? [];
+    if (folderNotes.length === 0) continue;
+    let bundle = bundles.get(folderSlug);
+    if (!bundle) {
+      const folderName = basename(folderPath) || folderPath;
+      bundle = { slug: folderSlug, name: folderName, notes: [] };
+      bundles.set(folderSlug, bundle);
+    }
+    for (const note of folderNotes) {
+      if (!bundle.notes.some((n) => n.vaultPath === note.vaultPath)) {
+        bundle.notes.push(note);
+      }
+    }
+  }
+
+  const wanted = new Set<string>();
+
+  // Standalone copies for every published note.
+  for (const [, note] of notes) {
+    await stageNoteCopy(
+      note,
+      `${note.slug}.md`,
+      "",
+      notes,
+      byName,
+      embedSlugByPath,
+      wanted,
+    );
+  }
+
+  // Bundle copies (folder-scoped) + folder index page per bundle.
+  for (const bundle of bundles.values()) {
+    const scopePrefix = `${bundle.slug}/`;
+    // For legacy data.json-derived bundles (no folder_path in frontmatter),
+    // recover the bundle's vault root so we can compute a folder_path for
+    // each note. Reverse-lookup the data.json mapping.
+    let bundleRoot: string | null = null;
+    for (const [vp, fs] of Object.entries(folderSlugs)) {
+      if (fs === bundle.slug) {
+        bundleRoot = vp;
+        break;
+      }
+    }
+    for (const note of bundle.notes) {
+      // Prefer the explicit folder_path the plugin wrote. Three fallbacks
+      // so older plugin versions still produce a hierarchical sidebar:
+      //   1. If data.json mapped a vault folder to this bundle slug, use
+      //      `note.relPath - dataJsonBundleRoot`.
+      //   2. If frontmatter carries folder_name (older plugins did write
+      //      this), locate that folder name as a path segment in the
+      //      note's vault path and take everything after it.
+      //   3. Last resort: basename only — the note renders flat as a leaf.
+      let folderPath = note.folderPath;
+      if (!folderPath && bundleRoot && note.relPath.startsWith(bundleRoot + "/")) {
+        folderPath = note.relPath
+          .slice(bundleRoot.length + 1)
+          .replace(/\.md$/i, "");
+      }
+      if (!folderPath && note.folderName) {
+        const segs = note.relPath.split("/");
+        const idx = segs.indexOf(note.folderName);
+        if (idx >= 0) {
+          folderPath = segs
+            .slice(idx + 1)
+            .join("/")
+            .replace(/\.md$/i, "");
+        }
+      }
+      if (!folderPath) {
+        folderPath = basename(note.relPath).replace(/\.md$/i, "");
+      }
+      await stageNoteCopy(
+        note,
+        `${bundle.slug}/${note.slug}.md`,
+        scopePrefix,
+        notes,
+        byName,
+        embedSlugByPath,
+        wanted,
+        folderPath,
+      );
+    }
+    // Folder index page — emitted at content root as `<folder-slug>.md` so
+    // Quartz produces `<folder-slug>.html` that Caddy's try_files serves at
+    // `/<folder-slug>`. Quartz v4 does not treat `<folder>/index.md` as a
+    // folder root without the FolderPage emitter (which we intentionally
+    // removed for privacy).
+    const indexContent = generateFolderIndex(
+      bundle.name,
+      bundle.slug,
+      bundle.notes,
+    );
+    const indexPath = join(CONTENT, `${bundle.slug}.md`);
+    await Deno.writeTextFile(indexPath, indexContent);
+    wanted.add(indexPath);
+
+    // Folder search index — pf-find.js fetches this lazily when the user
+    // opens the "this folder" tab. Lives under the bundle dir so Quartz/
+    // Caddy serves it at the same origin as the bundle pages.
+    const searchPath = join(CONTENT, bundle.slug, "_search.json");
+    await ensureDir(dirname(searchPath));
+    await Deno.writeTextFile(searchPath, generateFolderSearchIndex(bundle.notes));
+    wanted.add(searchPath);
+  }
+
+  // ---- Pass 6: stage embeds (always at content root, flat) ----
+  for (const [path, slug] of embedSlugByPath) {
+    const ext = extname(path);
+    const dst = join(CONTENT, `${slug}${ext}`);
+    let needCopy = true;
+    try {
+      const a = await Deno.stat(path);
+      const b = await Deno.stat(dst);
+      if (
+        a.size === b.size &&
+        a.mtime && b.mtime &&
+        a.mtime.getTime() === b.mtime.getTime()
+      ) needCopy = false;
+    } catch { /* dst missing */ }
+    if (needCopy) await Deno.copyFile(path, dst);
+    wanted.add(dst);
+  }
+
+  // ---- Pass 7: remove anything no longer wanted ----
+  let removed = 0;
+  const emptyDirCandidates = new Set<string>();
+  try {
+    for await (const entry of walk(CONTENT, { includeDirs: false })) {
+      if (!wanted.has(entry.path)) {
+        await Deno.remove(entry.path);
+        emptyDirCandidates.add(dirname(entry.path));
+        removed++;
+      }
+    }
+  } catch { /* dir gone */ }
+  // Best-effort empty-dir prune.
+  for (const dir of emptyDirCandidates) {
+    let current = dir;
+    while (current.startsWith(CONTENT) && current !== CONTENT) {
+      try {
+        const empty = (await Array.fromAsync(Deno.readDir(current))).length === 0;
+        if (!empty) break;
+        await Deno.remove(current);
+        current = dirname(current);
+      } catch { break; }
+    }
+  }
+
+  console.log(
+    `[stager] reconciled: notes=${notes.size} bundles=${bundles.size} embeds=${embedSlugByPath.size} removed=${removed}`,
+  );
+}
+
+let pending: number | null = null;
+function debounced() {
+  if (pending !== null) clearTimeout(pending);
+  pending = setTimeout(() => {
+    pending = null;
+    reconcile().catch((e) => console.error("[stager] error:", e));
+  }, DEBOUNCE_MS);
+}
+
+console.log(`[stager] starting; vault=${VAULT} content=${CONTENT}`);
+await reconcile();
+
+const watcher = Deno.watchFs(VAULT, { recursive: true });
+for await (const ev of watcher) {
+  // Skip irrelevant dirs but always react to plugin data changes.
+  const interesting = ev.paths.some((p) => {
+    if (p.includes("/.obsidian/plugins/quartz-publish-toggle/data.json")) return true;
+    return !SKIP_DIRS.some((re) => re.test(p));
+  });
+  if (interesting) debounced();
+}

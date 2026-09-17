@@ -1,0 +1,23 @@
+#!/command/with-contenv sh
+# with-contenv: s6-overlay v3 does not pass the container's environment into
+# service run scripts by default, so PUBLIC_DOMAIN/PAGE_TITLE (passed via
+# `docker run -e` / compose `environment:`) would otherwise be invisible here.
+#
+# Renders quartz.config.ts from the template (baseUrl/pageTitle come from
+# env) then hands off to the vendored build-watch loop.
+set -e
+
+# s6 run scripts execute with cwd=/, not Docker's WORKDIR — entrypoint.sh's
+# `npx quartz build` needs to run from /quartz to find the locally installed
+# quartz bin.
+cd /quartz
+
+: "${PUBLIC_DOMAIN:?PUBLIC_DOMAIN must be set (bare domain, e.g. notes.example.com)}"
+: "${PAGE_TITLE:=My published notes}"
+export PUBLIC_DOMAIN PAGE_TITLE
+
+envsubst '${PUBLIC_DOMAIN} ${PAGE_TITLE}' \
+  < /quartz/quartz.config.ts.template \
+  > /quartz/quartz.config.ts
+
+exec /entrypoint.sh
